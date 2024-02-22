@@ -8,15 +8,30 @@ use write_fonts::pens::BezPathPen;
 const DEFAULT_TEST_STRING: &str =
     r#"1234567890-=!@#$%^&*()_+qWeRtYuIoP[]|AsDfGhJkL:"zXcVbNm,.<>{}[]üøéåîÿçñè"#;
 
-/// Seems shockingly high but reflects actual observed results
-///
-/// For example, nearest (104.06, -416.96) is (103.32081258597977, -416.74961307615433), 0.77 apart
-const UPEM_EPSILON: f64 = 15.0;
 const NEAREST_EPSILON: f64 = 0.0000001;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Default seems shockingly high but reflects actual observed results
+    ///
+    /// Even very visually similar families have diffs up to 2.5 or so.
+    /// How near the nearest point must be to count as the same, relative to 1000 upem
+    #[arg(long)]
+    #[clap(default_value_t = 2.0)]
+    equivalence: f64,
+
+    /// If the sum of squared distance to nearest for all points exceeds budget consider the letterforms
+    /// different.
+    #[arg(long)]
+    #[clap(default_value_t = 100.0)]
+    budget: f64,
+
+    /// If any nearest test is further apart than this consider the letterforms different
+    #[arg(long)]
+    #[clap(default_value_t = 25.0)]
+    error: f64,
+
     /// Compare these characters to detect duplication
     #[arg(short, long)]
     test_string: Option<String>,
@@ -25,8 +40,25 @@ struct Args {
     files: Vec<String>,
 }
 
+impl Args {
+    fn rules(&self) -> RulesOfSimilarity {
+        RulesOfSimilarity {
+            equivalence: self.equivalence,
+            budget: self.budget,
+            error: self.error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RulesOfSimilarity {
+    equivalence: f64,
+    budget: f64,
+    error: f64,
+}
+
 trait AboutTheSame<T = Self> {
-    fn approximately_equal(&self, other: &T) -> bool;
+    fn approximately_equal(&self, other: &T, rules: RulesOfSimilarity) -> bool;
 }
 
 fn nearest(p: Point, other: &BezPath) -> Point {
@@ -45,20 +77,30 @@ impl AboutTheSame for BezPath {
     /// Meant to work with non-adversarial, similar, curves like letterforms
     ///
     /// Think the same I drawn with two different sets of drawing commands    
-    fn approximately_equal(&self, other: &Self) -> bool {
+    fn approximately_equal(&self, other: &Self, rules: RulesOfSimilarity) -> bool {
+        let mut budget = rules.budget;
         for segment in self.segments() {
             for t in 0..=10 {
                 let t = t as f64 / 10.0;
                 let pt_self = segment.eval(t);
                 let pt_other = nearest(pt_self, other);
                 let separation = (pt_self - pt_other).length();
-                if separation > UPEM_EPSILON {
-                    eprintln!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart",);
+
+                if separation <= rules.equivalence {
+                    continue;
+                }
+                if separation > rules.error {
+                    eprintln!("Hard fail, {pt_self:?} is {pt_other:?}, {separation:.2} apart",);
+                    return false;
+                }
+                budget -= separation.powf(2.0);
+                eprintln!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart. {}/{} budget remains.", budget, rules.budget);
+                if budget < 0.0 {
+                    eprintln!("Fail due to exhausted budget");
                     return false;
                 }
             }
         }
-        // Failed to find any point whose nearest on other was too far away
         true
     }
 }
@@ -89,6 +131,8 @@ fn svg_circle(x: f64, y: f64, r: f64) -> String {
 
 fn main() {
     let args = Args::parse();
+    let rules = args.rules();
+    eprintln!("The rules are {rules:?}");
 
     let paths: Vec<_> = args
         .files
@@ -162,7 +206,9 @@ fn main() {
     for c in test_chars.iter() {
         let paths = glyphs.get(c).unwrap();
         let first_path = &paths.first().unwrap();
-        let consistent = paths.iter().all(|p| first_path.approximately_equal(p));
+        let consistent = paths
+            .iter()
+            .all(|p| first_path.approximately_equal(p, rules));
         results.entry(consistent).or_default().push(*c);
     }
     for (consistent, chars) in results.iter() {

@@ -1,11 +1,14 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, f64::consts::PI, fs, path::Path};
 
 use clap::{command, Parser};
-use kurbo::{Affine, BezPath, Rect, Shape};
-use skrifa::{instance::Size, outline::OutlinePen, raw::TableProvider, FontRef, MetadataProvider};
+use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
+use skrifa::{instance::Size, raw::TableProvider, FontRef, MetadataProvider};
+use write_fonts::pens::BezPathPen;
 
 const DEFAULT_TEST_STRING: &str =
     r#"1234567890-=!@#$%^&*()_+qWeRtYuIoP[]|AsDfGhJkL:"zXcVbNm,.<>{}[]üøéåîÿçñè"#;
+
+const UPEM_EPSILON: f64 = 0.001;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -18,36 +21,76 @@ struct Args {
     files: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-struct GlyphPath {
-    path: BezPath,
+fn oncurve_points(path: &BezPath) -> Vec<Point> {
+    let mut last_start = None;
+    let mut result = Vec::with_capacity(path.elements().len());
+    for el in path.elements() {
+        match el {
+            PathEl::MoveTo(end) => {
+                last_start = Some(*end);
+                result.push(*end);
+            }
+            PathEl::LineTo(end) | PathEl::QuadTo(_, end) | PathEl::CurveTo(.., end) => {
+                result.push(*end)
+            }
+            PathEl::ClosePath => {
+                result.push(last_start.unwrap_or_else(|| panic!("Malformed path")))
+            }
+        }
+    }
+    result
 }
 
-impl OutlinePen for GlyphPath {
-    fn move_to(&mut self, x: f32, y: f32) {
-        self.path.move_to((x as f64, y as f64));
-    }
+fn normalize(debug: &str, paths: &mut Vec<BezPath>) {
+    let Some(first) = paths.first() else {
+        return;
+    };
 
-    fn line_to(&mut self, x: f32, y: f32) {
-        self.path.line_to((x as f64, y as f64));
-    }
+    // TODO: process subpath by subpath
 
-    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
-        self.path
-            .quad_to((cx0 as f64, cy0 as f64), (x as f64, y as f64));
+    if first.elements().len() < 2 {
+        return;
     }
+    // TODO: We want to start at desired[0] and move in the direction of desired[1]
+    // Right now we could end up reversed and not notice
+    let desired_oncurve = oncurve_points(first);
 
-    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        self.path.curve_to(
-            (cx0 as f64, cy0 as f64),
-            (cx1 as f64, cy1 as f64),
-            (x as f64, y as f64),
-        );
-    }
+    for i in 1..paths.len() {
+        let path = &paths[i];
+        assert!(matches!(path.elements().first(), Some(PathEl::MoveTo(..))));
 
-    fn close(&mut self) {
-        self.path.close_path()
+        let points = oncurve_points(path);
+        let Some(start_idx) = points
+            .iter()
+            .position(|p| (*p - desired_oncurve[0]).length() < UPEM_EPSILON)
+        else {
+            eprintln!("{debug} start not present in points?!");
+            continue;
+        };
+        if start_idx == 0 {
+            continue;
+        }
+
+        let mut fixed = Vec::new();
+        // add elements back in the new order
+        fixed.push(PathEl::MoveTo(desired_oncurve[0]));
+        for i in start_idx..(start_idx + path.elements().len()) {
+            let el_idx = i % path.elements().len();
+            let el = path.elements()[el_idx];
+            match el {
+                PathEl::ClosePath => fixed.push(PathEl::LineTo(points[el_idx])),
+                PathEl::MoveTo(..) => (),
+                _ => fixed.push(el),
+            }
+        }
+        fixed.push(PathEl::ClosePath);
+
+        paths[i] = BezPath::from_vec(fixed);
     }
+}
+
+fn svg_circle(x: f64, y: f64, r: f64) -> String {
+    format!("<circle fill=\"darkblue\" opacity=\"0.25\" cx=\"{x}\" cy=\"{y}\" r=\"{r}\" />\n")
 }
 
 fn main() {
@@ -91,43 +134,46 @@ fn main() {
         .unwrap_or(DEFAULT_TEST_STRING)
         .chars()
         .collect::<Vec<_>>();
-    let mut glyphs = Vec::new();
+    let mut glyphs: HashMap<char, Vec<BezPath>> = Default::default();
 
     // Really we should shape the test string but we don't have a safe shaper.
     // This should suffice for copied Latin which is our primarily use case.
     for (path, font) in paths.iter().zip(fonts) {
         let upem = font.head().unwrap().units_per_em();
-        let scale = (upem != max_upem).then(|| Affine::scale(max_upem as f64 / upem as f64));
+        let uniform_scale = if upem != max_upem {
+            max_upem as f64 / upem as f64
+        } else {
+            1.0
+        };
+        let transform = Affine::scale_non_uniform(uniform_scale, -uniform_scale);
         let cmap = font.cmap().unwrap();
         let outlines = font.outline_glyphs();
 
-        if let Some(scale) = scale {
-            eprintln!("Scaling {path:?} by {scale:?}");
-        }
-
-        glyphs.push(Vec::new());
         for c in test_chars.iter() {
-            let mut glyph_path = GlyphPath::default();
+            let mut path = BezPath::default();
 
             if let Some(gid) = cmap.map_codepoint(*c) {
                 let glyph = outlines.get(gid).unwrap();
-                glyph.draw(Size::unscaled(), &mut glyph_path).unwrap();
-                if let Some(scale) = scale {
-                    glyph_path.path.apply_affine(scale);
-                }
+                let mut pen = BezPathPen::new();
+                glyph.draw(Size::unscaled(), &mut pen).unwrap();
+                path = pen.into_inner();
+                path.apply_affine(transform);
             }
-            glyphs.last_mut().unwrap().push(glyph_path);
+            glyphs.entry(*c).or_default().push(path);
         }
+    }
+
+    // In a fascinating turn of events it seems we sometimes have the same path with a different start point
+    for (c, paths) in glyphs.iter_mut() {
+        normalize(format!("{c}").as_str(), paths);
     }
 
     // We have every char for every font scaled to a common upem; are they the same?
     let mut results: HashMap<bool, Vec<char>> = Default::default();
-    for (i, c) in test_chars.iter().enumerate() {
-        let first_path = &glyphs.first().unwrap()[i];
-        let consistent = glyphs
-            .iter()
-            .map(|paths| &paths[i])
-            .all(|p| first_path == p);
+    for c in test_chars.iter() {
+        let paths = glyphs.get(c).unwrap();
+        let first_path = &paths.first().unwrap();
+        let consistent = paths.iter().all(|p| *first_path == p);
         results.entry(consistent).or_default().push(*c);
     }
     for (consistent, chars) in results.iter() {
@@ -149,12 +195,39 @@ fn main() {
         for c in inconsistent {
             let mut viewbox = Rect::new(0.0, 0.0, 0.0, 0.0);
             let mut svg = String::new();
-            let i = test_chars.iter().position(|tc| tc == c).unwrap();
-            for path in glyphs.iter().map(|paths| &paths[i]) {
+            let marker_radius = max_upem as f64 * 0.01;
+            for path in glyphs.get(c).unwrap() {
+                // actual path
                 svg.push_str(
-                    format!("<path opacity=\"0.25\" d=\"{}\" />\n", path.path.to_svg()).as_str(),
+                    format!("<path opacity=\"0.25\" d=\"{}\" />\n", path.to_svg()).as_str(),
                 );
-                viewbox = viewbox.union(path.path.bounding_box());
+            }
+            for path in glyphs.get(c).unwrap() {
+                // start marker
+                if let Some(PathEl::MoveTo(p)) = path.elements().first() {
+                    svg.push_str(svg_circle(p.x, p.y, marker_radius).as_str());
+                }
+                // direction markers
+                for pair in oncurve_points(path).windows(2) {
+                    // TODO fix for curves by drawing at t=0.5 in the direction of the tangent
+
+                    let mid = pair[0].midpoint(pair[1]);
+                    let backtrack = (pair[0] - mid).normalize() * marker_radius;
+                    let p0 = mid + (Affine::rotate(PI / 4.0) * backtrack.to_point()).to_vec2();
+                    let p1 = mid + (Affine::rotate(-PI / 4.0) * backtrack.to_point()).to_vec2();
+
+                    let mut marker_path = BezPath::new();
+                    marker_path.move_to(mid);
+                    marker_path.line_to(p0);
+                    marker_path.line_to(p1);
+                    marker_path.close_path();
+
+                    // svg.push_str(
+                    //     format!("<path opacity=\"0.25\" d=\"{}\" />\n", marker_path.to_svg()).as_str(),
+                    // );
+                }
+
+                viewbox = viewbox.union(path.bounding_box());
             }
             let margin = 0.1 * viewbox.width().max(viewbox.height());
             svg = format!(

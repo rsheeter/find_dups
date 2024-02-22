@@ -1,4 +1,4 @@
-use std::{collections::HashMap, f64::consts::PI, fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use clap::{command, Parser};
 use kurbo::{Affine, BezPath, ParamCurve, ParamCurveNearest, PathEl, Point, Rect, Shape};
@@ -137,26 +137,6 @@ impl AboutTheSame for BezPath {
         }
         Ok(())
     }
-}
-
-fn oncurve_points(path: &BezPath) -> Vec<Point> {
-    let mut last_start = None;
-    let mut result = Vec::with_capacity(path.elements().len());
-    for el in path.elements() {
-        match el {
-            PathEl::MoveTo(end) => {
-                last_start = Some(*end);
-                result.push(*end);
-            }
-            PathEl::LineTo(end) | PathEl::QuadTo(_, end) | PathEl::CurveTo(.., end) => {
-                result.push(*end)
-            }
-            PathEl::ClosePath => {
-                result.push(last_start.unwrap_or_else(|| panic!("Malformed path")))
-            }
-        }
-    }
-    result
 }
 
 fn svg_circle(x: f64, y: f64, r: f64) -> String {
@@ -302,26 +282,6 @@ fn main() {
             if let Some(PathEl::MoveTo(p)) = path.elements().first() {
                 svg.push_str(svg_circle(p.x, p.y, marker_radius).as_str());
             }
-            // direction markers
-            for pair in oncurve_points(path).windows(2) {
-                // TODO fix for curves by drawing at t=0.5 in the direction of the tangent
-
-                let mid = pair[0].midpoint(pair[1]);
-                let backtrack = (pair[0] - mid).normalize() * marker_radius;
-                let p0 = mid + (Affine::rotate(PI / 4.0) * backtrack.to_point()).to_vec2();
-                let p1 = mid + (Affine::rotate(-PI / 4.0) * backtrack.to_point()).to_vec2();
-
-                let mut marker_path = BezPath::new();
-                marker_path.move_to(mid);
-                marker_path.line_to(p0);
-                marker_path.line_to(p1);
-                marker_path.close_path();
-
-                // svg.push_str(
-                //     format!("<path opacity=\"0.25\" d=\"{}\" />\n", marker_path.to_svg()).as_str(),
-                // );
-            }
-
             viewbox = viewbox.union(path.bounding_box());
         }
 

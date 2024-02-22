@@ -3,6 +3,7 @@ use std::{collections::HashMap, f64::consts::PI, fs, path::Path};
 use clap::{command, Parser};
 use kurbo::{Affine, BezPath, ParamCurve, ParamCurveNearest, PathEl, Point, Rect, Shape};
 use skrifa::{instance::Size, raw::TableProvider, FontRef, MetadataProvider};
+use thiserror::Error;
 use write_fonts::pens::BezPathPen;
 
 const DEFAULT_TEST_STRING: &str =
@@ -33,8 +34,9 @@ struct Args {
     error: f64,
 
     /// Compare these characters to detect duplication
-    #[arg(short, long)]
-    test_string: Option<String>,
+    #[arg(long)]
+    #[clap(default_value_t = DEFAULT_TEST_STRING.to_string())]
+    test_string: String,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     files: Vec<String>,
@@ -57,8 +59,23 @@ struct RulesOfSimilarity {
     error: f64,
 }
 
+#[derive(Error, Debug)]
+enum ApproximatelyEqualError {
+    #[error("{separation:.2} exceeds error limit. {rules:?}.")]
+    BrokeTheHardDeck {
+        separation: f64,
+        rules: RulesOfSimilarity,
+    },
+    #[error("Exhaused budget. {0:?}.")]
+    ExhaustedBudget(RulesOfSimilarity),
+}
+
 trait AboutTheSame<T = Self> {
-    fn approximately_equal(&self, other: &T, rules: RulesOfSimilarity) -> bool;
+    fn approximately_equal(
+        &self,
+        other: &T,
+        rules: RulesOfSimilarity,
+    ) -> Result<(), ApproximatelyEqualError>;
 }
 
 fn nearest(p: Point, other: &BezPath) -> Point {
@@ -77,7 +94,11 @@ impl AboutTheSame for BezPath {
     /// Meant to work with non-adversarial, similar, curves like letterforms
     ///
     /// Think the same I drawn with two different sets of drawing commands    
-    fn approximately_equal(&self, other: &Self, rules: RulesOfSimilarity) -> bool {
+    fn approximately_equal(
+        &self,
+        other: &Self,
+        rules: RulesOfSimilarity,
+    ) -> Result<(), ApproximatelyEqualError> {
         let mut budget = rules.budget;
         for segment in self.segments() {
             for t in 0..=10 {
@@ -90,18 +111,17 @@ impl AboutTheSame for BezPath {
                     continue;
                 }
                 if separation > rules.error {
-                    eprintln!("Hard fail, {pt_self:?} is {pt_other:?}, {separation:.2} apart",);
-                    return false;
+                    return Err(ApproximatelyEqualError::BrokeTheHardDeck { separation, rules });
                 }
                 budget -= separation.powf(2.0);
                 eprintln!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart. {}/{} budget remains.", budget, rules.budget);
                 if budget < 0.0 {
                     eprintln!("Fail due to exhausted budget");
-                    return false;
+                    return Err(ApproximatelyEqualError::ExhaustedBudget(rules));
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -166,12 +186,7 @@ fn main() {
         .map(|f| f.head().unwrap().units_per_em())
         .max()
         .unwrap();
-    let test_chars = args
-        .test_string
-        .as_deref()
-        .unwrap_or(DEFAULT_TEST_STRING)
-        .chars()
-        .collect::<Vec<_>>();
+    let test_chars = args.test_string.chars().collect::<Vec<_>>();
     let mut glyphs: HashMap<char, Vec<BezPath>> = Default::default();
 
     // Really we should shape the test string but we don't have a safe shaper.
@@ -202,16 +217,28 @@ fn main() {
     }
 
     // We have every char for every font scaled to a common upem; are they the same?
-    let mut results: HashMap<bool, Vec<char>> = Default::default();
+    let mut failures: HashMap<char, Vec<ApproximatelyEqualError>> = Default::default();
+    let mut consistent: HashMap<bool, Vec<char>> = Default::default();
     for c in test_chars.iter() {
         let paths = glyphs.get(c).unwrap();
         let first_path = &paths.first().unwrap();
-        let consistent = paths
+        let errors: Vec<_> = paths
             .iter()
-            .all(|p| first_path.approximately_equal(p, rules));
-        results.entry(consistent).or_default().push(*c);
+            .filter_map(|p| {
+                let result = first_path.approximately_equal(p, rules);
+                match result {
+                    Ok(..) => None,
+                    Err(e) => Some(e),
+                }
+            })
+            .collect();
+        consistent.entry(errors.is_empty()).or_default().push(*c);
+        if !errors.is_empty() {
+            failures.entry(*c).or_default().extend(errors);
+        }
     }
-    for (consistent, chars) in results.iter() {
+
+    for (consistent, chars) in consistent.iter() {
         let prefix = if *consistent {
             "Consistent"
         } else {
@@ -226,54 +253,63 @@ fn main() {
         );
     }
 
-    if let Some(inconsistent) = results.get(&false) {
-        for c in inconsistent {
-            let mut viewbox = Rect::new(0.0, 0.0, 0.0, 0.0);
-            let mut svg = String::new();
-            let marker_radius = max_upem as f64 * 0.01;
-            for path in glyphs.get(c).unwrap() {
-                // actual path
-                svg.push_str(
-                    format!("<path opacity=\"0.25\" d=\"{}\" />\n", path.to_svg()).as_str(),
-                );
-            }
-            for path in glyphs.get(c).unwrap() {
-                // start marker
-                if let Some(PathEl::MoveTo(p)) = path.elements().first() {
-                    svg.push_str(svg_circle(p.x, p.y, marker_radius).as_str());
-                }
-                // direction markers
-                for pair in oncurve_points(path).windows(2) {
-                    // TODO fix for curves by drawing at t=0.5 in the direction of the tangent
-
-                    let mid = pair[0].midpoint(pair[1]);
-                    let backtrack = (pair[0] - mid).normalize() * marker_radius;
-                    let p0 = mid + (Affine::rotate(PI / 4.0) * backtrack.to_point()).to_vec2();
-                    let p1 = mid + (Affine::rotate(-PI / 4.0) * backtrack.to_point()).to_vec2();
-
-                    let mut marker_path = BezPath::new();
-                    marker_path.move_to(mid);
-                    marker_path.line_to(p0);
-                    marker_path.line_to(p1);
-                    marker_path.close_path();
-
-                    // svg.push_str(
-                    //     format!("<path opacity=\"0.25\" d=\"{}\" />\n", marker_path.to_svg()).as_str(),
-                    // );
-                }
-
-                viewbox = viewbox.union(path.bounding_box());
-            }
-            let margin = 0.1 * viewbox.width().max(viewbox.height());
-            svg = format!(
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\">\n{}\n</svg>",
-                viewbox.min_x() - margin,
-                viewbox.min_y() - margin,
-                viewbox.width() + 2.0 * margin,
-                viewbox.height() + 2.0 * margin,
-                svg
-            );
-            fs::write(format!("inconsistent-{c}.svg"), svg).unwrap();
+    for (c, errors) in failures.iter() {
+        let mut viewbox = Rect::new(0.0, 0.0, 0.0, 0.0);
+        let mut svg = String::new();
+        let marker_radius = max_upem as f64 * 0.01;
+        for path in glyphs.get(c).unwrap() {
+            // actual path
+            svg.push_str(format!("<path opacity=\"0.25\" d=\"{}\" />\n", path.to_svg()).as_str());
         }
+        for path in glyphs.get(c).unwrap() {
+            // start marker
+            if let Some(PathEl::MoveTo(p)) = path.elements().first() {
+                svg.push_str(svg_circle(p.x, p.y, marker_radius).as_str());
+            }
+            // direction markers
+            for pair in oncurve_points(path).windows(2) {
+                // TODO fix for curves by drawing at t=0.5 in the direction of the tangent
+
+                let mid = pair[0].midpoint(pair[1]);
+                let backtrack = (pair[0] - mid).normalize() * marker_radius;
+                let p0 = mid + (Affine::rotate(PI / 4.0) * backtrack.to_point()).to_vec2();
+                let p1 = mid + (Affine::rotate(-PI / 4.0) * backtrack.to_point()).to_vec2();
+
+                let mut marker_path = BezPath::new();
+                marker_path.move_to(mid);
+                marker_path.line_to(p0);
+                marker_path.line_to(p1);
+                marker_path.close_path();
+
+                // svg.push_str(
+                //     format!("<path opacity=\"0.25\" d=\"{}\" />\n", marker_path.to_svg()).as_str(),
+                // );
+            }
+
+            viewbox = viewbox.union(path.bounding_box());
+        }
+
+        let margin = 0.1 * viewbox.width().max(viewbox.height());
+
+        for (i, error) in errors.iter().enumerate() {
+            svg.push_str(
+                format!(
+                    "<text x=\"{}\" y=\"{}\" font-family=\"monospace\" font-size=\"small\">{error}</text>",
+                    viewbox.min_x(),
+                    viewbox.min_y() + i as f64 * margin,
+                )
+                .as_str(),
+            );
+        }
+
+        svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\">\n{}\n</svg>",
+            viewbox.min_x() - margin,
+            viewbox.min_y() - margin,
+            viewbox.width() + 2.0 * margin,
+            viewbox.height() + 2.0 * margin,
+            svg
+        );
+        fs::write(format!("inconsistent-{c}.svg"), svg).unwrap();
     }
 }

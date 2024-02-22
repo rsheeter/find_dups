@@ -9,4 +9,5 @@ edition = "2021"
 clap = { version = "4.5.1", features = ["derive"] }
 kurbo = "0.10.4"
 skrifa = "0.15.5"
+thiserror = "1.0.57"
 write-fonts = "0.22.1"  # pens

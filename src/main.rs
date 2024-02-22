@@ -1,14 +1,18 @@
 use std::{collections::HashMap, f64::consts::PI, fs, path::Path};
 
 use clap::{command, Parser};
-use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
+use kurbo::{Affine, BezPath, ParamCurve, ParamCurveNearest, PathEl, Point, Rect, Shape};
 use skrifa::{instance::Size, raw::TableProvider, FontRef, MetadataProvider};
 use write_fonts::pens::BezPathPen;
 
 const DEFAULT_TEST_STRING: &str =
     r#"1234567890-=!@#$%^&*()_+qWeRtYuIoP[]|AsDfGhJkL:"zXcVbNm,.<>{}[]üøéåîÿçñè"#;
 
-const UPEM_EPSILON: f64 = 0.001;
+/// Seems shockingly high but reflects actual observed results
+///
+/// For example, nearest (104.06, -416.96) is (103.32081258597977, -416.74961307615433), 0.77 apart
+const UPEM_EPSILON: f64 = 15.0;
+const NEAREST_EPSILON: f64 = 0.0000001;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -19,6 +23,44 @@ struct Args {
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     files: Vec<String>,
+}
+
+trait AboutTheSame<T = Self> {
+    fn approximately_equal(&self, other: &T) -> bool;
+}
+
+fn nearest(p: Point, other: &BezPath) -> Point {
+    other
+        .segments()
+        .map(|s| {
+            let nearest = s.nearest(p, NEAREST_EPSILON);
+            (nearest.distance_sq, s.eval(nearest.t))
+        })
+        .reduce(|acc, e| if acc.0 <= e.0 { acc } else { e })
+        .expect("Don't use this with empty paths")
+        .1
+}
+
+impl AboutTheSame for BezPath {
+    /// Meant to work with non-adversarial, similar, curves like letterforms
+    ///
+    /// Think the same I drawn with two different sets of drawing commands    
+    fn approximately_equal(&self, other: &Self) -> bool {
+        for segment in self.segments() {
+            for t in 0..=10 {
+                let t = t as f64 / 10.0;
+                let pt_self = segment.eval(t);
+                let pt_other = nearest(pt_self, other);
+                let separation = (pt_self - pt_other).length();
+                if separation > UPEM_EPSILON {
+                    eprintln!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart",);
+                    return false;
+                }
+            }
+        }
+        // Failed to find any point whose nearest on other was too far away
+        true
+    }
 }
 
 fn oncurve_points(path: &BezPath) -> Vec<Point> {
@@ -39,54 +81,6 @@ fn oncurve_points(path: &BezPath) -> Vec<Point> {
         }
     }
     result
-}
-
-fn normalize(debug: &str, paths: &mut Vec<BezPath>) {
-    let Some(first) = paths.first() else {
-        return;
-    };
-
-    // TODO: process subpath by subpath
-
-    if first.elements().len() < 2 {
-        return;
-    }
-    // TODO: We want to start at desired[0] and move in the direction of desired[1]
-    // Right now we could end up reversed and not notice
-    let desired_oncurve = oncurve_points(first);
-
-    for i in 1..paths.len() {
-        let path = &paths[i];
-        assert!(matches!(path.elements().first(), Some(PathEl::MoveTo(..))));
-
-        let points = oncurve_points(path);
-        let Some(start_idx) = points
-            .iter()
-            .position(|p| (*p - desired_oncurve[0]).length() < UPEM_EPSILON)
-        else {
-            eprintln!("{debug} start not present in points?!");
-            continue;
-        };
-        if start_idx == 0 {
-            continue;
-        }
-
-        let mut fixed = Vec::new();
-        // add elements back in the new order
-        fixed.push(PathEl::MoveTo(desired_oncurve[0]));
-        for i in start_idx..(start_idx + path.elements().len()) {
-            let el_idx = i % path.elements().len();
-            let el = path.elements()[el_idx];
-            match el {
-                PathEl::ClosePath => fixed.push(PathEl::LineTo(points[el_idx])),
-                PathEl::MoveTo(..) => (),
-                _ => fixed.push(el),
-            }
-        }
-        fixed.push(PathEl::ClosePath);
-
-        paths[i] = BezPath::from_vec(fixed);
-    }
 }
 
 fn svg_circle(x: f64, y: f64, r: f64) -> String {
@@ -138,7 +132,7 @@ fn main() {
 
     // Really we should shape the test string but we don't have a safe shaper.
     // This should suffice for copied Latin which is our primarily use case.
-    for (path, font) in paths.iter().zip(fonts) {
+    for font in fonts.iter() {
         let upem = font.head().unwrap().units_per_em();
         let uniform_scale = if upem != max_upem {
             max_upem as f64 / upem as f64
@@ -163,17 +157,12 @@ fn main() {
         }
     }
 
-    // In a fascinating turn of events it seems we sometimes have the same path with a different start point
-    for (c, paths) in glyphs.iter_mut() {
-        normalize(format!("{c}").as_str(), paths);
-    }
-
     // We have every char for every font scaled to a common upem; are they the same?
     let mut results: HashMap<bool, Vec<char>> = Default::default();
     for c in test_chars.iter() {
         let paths = glyphs.get(c).unwrap();
         let first_path = &paths.first().unwrap();
-        let consistent = paths.iter().all(|p| *first_path == p);
+        let consistent = paths.iter().all(|p| first_path.approximately_equal(p));
         results.entry(consistent).or_default().push(*c);
     }
     for (consistent, chars) in results.iter() {

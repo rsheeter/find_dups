@@ -59,6 +59,20 @@ struct RulesOfSimilarity {
     error: f64,
 }
 
+impl RulesOfSimilarity {
+    fn for_upem(self, upem: u16) -> Self {
+        if upem == 1000 {
+            return self;
+        };
+        let scale = upem as f64 / 1000.0;
+        Self {
+            equivalence: self.equivalence * scale,
+            budget: self.budget * scale,
+            error: self.error * scale,
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 enum ApproximatelyEqualError {
     #[error("{separation:.2} exceeds error limit. {rules:?}.")]
@@ -114,9 +128,9 @@ impl AboutTheSame for BezPath {
                     return Err(ApproximatelyEqualError::BrokeTheHardDeck { separation, rules });
                 }
                 budget -= separation.powf(2.0);
-                eprintln!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart. {}/{} budget remains.", budget, rules.budget);
+                log::debug!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart. {}/{} budget remains.", budget, rules.budget);
                 if budget < 0.0 {
-                    eprintln!("Fail due to exhausted budget");
+                    log::debug!("Fail due to exhausted budget");
                     return Err(ApproximatelyEqualError::ExhaustedBudget(rules));
                 }
             }
@@ -149,10 +163,28 @@ fn svg_circle(x: f64, y: f64, r: f64) -> String {
     format!("<circle fill=\"darkblue\" opacity=\"0.25\" cx=\"{x}\" cy=\"{y}\" r=\"{r}\" />\n")
 }
 
+fn init_logging() {
+    use std::io::Write;
+    env_logger::builder()
+        .format(|buf, record| {
+            let ts = buf.timestamp_micros();
+            writeln!(
+                buf,
+                "[{ts} {} {} {}] {}",
+                // we manually assign all threads a name
+                std::thread::current().name().unwrap_or("unknown"),
+                record.target(),
+                buf.default_level_style(record.level())
+                    .value(record.level()),
+                record.args()
+            )
+        })
+        .init();
+}
+
 fn main() {
     let args = Args::parse();
-    let rules = args.rules();
-    eprintln!("The rules are {rules:?}");
+    init_logging();
 
     let paths: Vec<_> = args
         .files
@@ -160,7 +192,7 @@ fn main() {
         .filter_map(|f| {
             let file = Path::new(f);
             if !file.is_file() {
-                eprintln!("{file:?} is not a file");
+                log::warn!("{file:?} is not a file");
                 return None;
             }
             Some(file)
@@ -176,7 +208,7 @@ fn main() {
         .collect();
 
     if fonts.is_empty() {
-        eprintln!("Not much to do with no fonts specified");
+        log::warn!("Not much to do with no fonts specified");
         return;
     }
 
@@ -188,6 +220,10 @@ fn main() {
         .unwrap();
     let test_chars = args.test_string.chars().collect::<Vec<_>>();
     let mut glyphs: HashMap<char, Vec<BezPath>> = Default::default();
+
+    // budget is based on 1000 upem; scale if necessary
+    let rules = args.rules().for_upem(max_upem);
+    log::info!("The rules are {rules:?}");
 
     // Really we should shape the test string but we don't have a safe shaper.
     // This should suffice for copied Latin which is our primarily use case.
@@ -244,7 +280,7 @@ fn main() {
         } else {
             "Inconsistent"
         };
-        eprintln!(
+        println!(
             "{} {}/{}: {}",
             prefix,
             chars.len(),

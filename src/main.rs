@@ -374,6 +374,12 @@ fn main() {
             fs::create_dir(working_dir).unwrap();
         }
         println!("Dumping glyphs to {working_dir:?}");
+        for svg_file in
+            glob::glob(working_dir.join("*.svg").to_str().expect("Oh no")).expect("To glob")
+        {
+            let svg_file = svg_file.expect("Access to working dir");
+            fs::remove_file(svg_file).expect("To be able to delete working dir files");
+        }
         dump_glyphs(working_dir, &letterforms);
     }
 

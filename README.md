@@ -14,4 +14,12 @@ Group, Score
 {"../fonts/ofl/bayon/Bayon-Regular.ttf", "../fonts/ofl/koulen/Koulen-Regular.ttf"}, 61/70
 {"../fonts/ofl/moulpali/Moulpali-Regular.ttf", "../fonts/ofl/share/Share-Regular.ttf"}, 61/70
 
+$ cargo run -- --dump-glyphs --match-pct 50 '../fonts/ofl/notosanstamil/NotoSansTamil[wdth,wght].ttf' '../fonts/ofl/notoseriftamil/NotoSerifTamil[wdth,wght].ttf'     '../fonts/ofl/notosans/NotoSans[wdth,wght].ttf' '../fonts/ofl/notoserif/NotoSerif[wdth,wght].ttf'
+
+...noise...
+
+Group, Score
+{"../fonts/ofl/notosans/NotoSans[wdth,wght].ttf", "../fonts/ofl/notosanstamil/NotoSansTamil[wdth,wght].ttf"}, 49/70
+{"../fonts/ofl/notoserif/NotoSerif[wdth,wght].ttf", "../fonts/ofl/notoseriftamil/NotoSerifTamil[wdth,wght].ttf"}, 68/70
+
 ```

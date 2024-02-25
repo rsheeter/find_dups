@@ -194,13 +194,6 @@ fn load_fonts<'a>(
     paths: impl Iterator<Item = &'a Path>,
 ) -> Result<HashMap<PathBuf, Vec<u8>>, io::Error> {
     paths
-        .filter(|p| {
-            if !p.is_file() {
-                log::warn!("{p:?} is not a file");
-                return false;
-            }
-            true
-        })
         .map(|p| Ok((p.to_path_buf(), fs::read(p)?)))
         .collect::<Result<_, _>>()
 }
@@ -320,7 +313,7 @@ fn main() {
         .collect();
 
     if fonts.is_empty() {
-        log::warn!("Not much to do with no fonts specified");
+        log::error!("Not much to do with no fonts specified");
         return;
     }
 

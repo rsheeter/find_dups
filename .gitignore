@@ -21,3 +21,6 @@ Cargo.lock
 # Python venv
 venv/
 .venv/
+
+# Debug output
+build/

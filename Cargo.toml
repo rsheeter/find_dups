@@ -7,10 +7,12 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.1", features = ["derive"] }
-kurbo = "0.10.4"
+kurbo = { version = "0.10.4", features = ["serde"] }
 skrifa = "0.15.5"
 thiserror = "1.0.57"
 write-fonts = "0.22.1"  # pens
+
+serde = "1.0"
 
 log = "0.4"
 env_logger = "0.10.0"

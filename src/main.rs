@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs, io,
     path::{self, Path, PathBuf},
 };
@@ -37,11 +37,13 @@ fn init_logging() {
         .init();
 }
 
-fn load_fonts<'a>(
-    paths: impl Iterator<Item = &'a Path>,
-) -> Result<HashMap<PathBuf, Vec<u8>>, io::Error> {
+fn load_fonts<'a>(paths: HashSet<PathBuf>) -> Result<HashMap<PathBuf, Vec<u8>>, io::Error> {
     paths
-        .map(|p| Ok((p.to_path_buf(), fs::read(p)?)))
+        .into_iter()
+        .map(|p| {
+            let contents = fs::read(&p)?;
+            Ok((p, contents))
+        })
         .collect::<Result<_, _>>()
 }
 
@@ -259,6 +261,7 @@ fn create_grouped_letterforms<'a>(
         } else {
             1.0
         };
+        log::debug!("Creating letterforms for {path:?}");
         for c in test_chars.iter() {
             let letterform = Letterform::create(font, *c, uniform_scale);
 
@@ -287,8 +290,8 @@ fn main() {
     init_logging();
 
     let test_chars = args.test_chars();
-    let raw_fonts = load_fonts(args.files.iter().map(Path::new))
-        .unwrap_or_else(|e| panic!("Unable to load fonts {e}"));
+    let raw_fonts =
+        load_fonts(args.font_files()).unwrap_or_else(|e| panic!("Unable to load fonts {e}"));
 
     let letterforms = create_grouped_letterforms(args.rules(), &test_chars, &raw_fonts).unwrap();
 

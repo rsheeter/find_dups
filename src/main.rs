@@ -1,171 +1,18 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     fs, io,
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
 };
 
-use clap::{command, Parser};
-use kurbo::{Affine, BezPath, ParamCurve, ParamCurveNearest, PathEl, Point, Shape};
+use clap::Parser;
+use kurbo::{Affine, BezPath, PathEl, Shape};
 use skrifa::{instance::Size, raw::TableProvider, FontRef, MetadataProvider};
-use thiserror::Error;
 use write_fonts::pens::BezPathPen;
 
-const DEFAULT_TEST_STRING: &str =
-    r#"1234567890-=!@#$%^&*()_+qWeRtYuIoP[]|AsDfGhJkL:"zXcVbNm,.<>{}[]üøéåîÿçñè"#;
-
-const DEFAULT_WORKING_DIR: &str = "build";
-
-const NEAREST_EPSILON: f64 = 0.0000001;
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// How near the nearest point must be to count as the same when comparing letterforms.
-    ///
-    /// Relative to 1000 upem. Default seems shockingly high but reflects actual observed results
-    ///
-    /// Even very visually similar families have diffs up to 2.5 or so.
-    #[arg(long)]
-    #[clap(default_value_t = 2.0)]
-    equivalence: f64,
-
-    /// If the sum of squared distance to nearest for all points exceeds budget consider the letterforms
-    /// different. Relative to 1000 upem.
-    #[arg(long)]
-    #[clap(default_value_t = 100.0)]
-    budget: f64,
-
-    /// If any nearest test point is further apart than this consider the letterforms different
-    #[arg(long)]
-    #[clap(default_value_t = 25.0)]
-    error: f64,
-
-    /// If this percentage of the unique characters in --test-string match consider font(s) to match
-    #[arg(long)]
-    #[clap(default_value_t = 80.0)]
-    match_pct: f64,
-
-    /// Compare these characters to detect duplication
-    #[arg(long)]
-    #[clap(default_value_t = DEFAULT_TEST_STRING.to_string())]
-    test_string: String,
-
-    /// If set, for each unique character in --test-string write an svg showing variants
-    #[arg(long)]
-    dump_glyphs: bool,
-
-    /// Where to read/write temp files. Retention can accelerate repeat executions.
-    #[arg(long)]
-    #[clap(default_value_t = DEFAULT_WORKING_DIR.to_string())]
-    working_dir: String,
-
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    files: Vec<String>,
-}
-
-impl Args {
-    fn rules(&self) -> RulesOfSimilarity {
-        RulesOfSimilarity {
-            equivalence: self.equivalence,
-            budget: self.budget,
-            error: self.error,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RulesOfSimilarity {
-    equivalence: f64,
-    budget: f64,
-    error: f64,
-}
-
-impl RulesOfSimilarity {
-    fn for_upem(self, upem: u16) -> Self {
-        if upem == 1000 {
-            return self;
-        };
-        let scale = upem as f64 / 1000.0;
-        Self {
-            equivalence: self.equivalence * scale,
-            budget: self.budget * scale,
-            error: self.error * scale,
-        }
-    }
-}
-
-#[derive(Error, Debug)]
-enum ApproximatelyEqualError {
-    #[error("{separation:.2} exceeds error limit. {rules:?}.")]
-    BrokeTheHardDeck {
-        separation: f64,
-        rules: RulesOfSimilarity,
-    },
-    #[error("Exhaused budget. {0:?}.")]
-    ExhaustedBudget(RulesOfSimilarity),
-    #[error("One of Self and other is empty")]
-    EmptinessMismatch,
-}
-
-trait AboutTheSame<T = Self> {
-    fn approximately_equal(
-        &self,
-        other: &T,
-        rules: RulesOfSimilarity,
-    ) -> Result<(), ApproximatelyEqualError>;
-}
-
-fn nearest(p: Point, other: &BezPath) -> Point {
-    other
-        .segments()
-        .map(|s| {
-            let nearest = s.nearest(p, NEAREST_EPSILON);
-            (nearest.distance_sq, s.eval(nearest.t))
-        })
-        .reduce(|acc, e| if acc.0 <= e.0 { acc } else { e })
-        .expect("Don't use this with empty paths")
-        .1
-}
-
-impl AboutTheSame for BezPath {
-    /// Meant to work with non-adversarial, similar, curves like letterforms
-    ///
-    /// Think the same I drawn with two different sets of drawing commands    
-    fn approximately_equal(
-        &self,
-        other: &Self,
-        rules: RulesOfSimilarity,
-    ) -> Result<(), ApproximatelyEqualError> {
-        let mut budget = rules.budget;
-
-        if self.is_empty() != other.is_empty() {
-            return Err(ApproximatelyEqualError::EmptinessMismatch);
-        }
-
-        for segment in self.segments() {
-            for t in 0..=10 {
-                let t = t as f64 / 10.0;
-                let pt_self = segment.eval(t);
-                let pt_other = nearest(pt_self, other);
-                let separation = (pt_self - pt_other).length();
-
-                if separation <= rules.equivalence {
-                    continue;
-                }
-                if separation > rules.error {
-                    return Err(ApproximatelyEqualError::BrokeTheHardDeck { separation, rules });
-                }
-                budget -= separation.powf(2.0);
-                log::debug!("Nearest {pt_self:?} is {pt_other:?}, {separation:.2} apart. {}/{} budget remains.", budget, rules.budget);
-                if budget < 0.0 {
-                    log::debug!("Fail due to exhausted budget");
-                    return Err(ApproximatelyEqualError::ExhaustedBudget(rules));
-                }
-            }
-        }
-        Ok(())
-    }
-}
+use find_dups::{
+    about_the_same::{AboutTheSame, ApproximatelyEqualError, RulesOfSimilarity},
+    args::Args,
+};
 
 fn svg_circle(x: f64, y: f64, r: f64) -> String {
     format!("<circle fill=\"darkblue\" opacity=\"0.25\" cx=\"{x}\" cy=\"{y}\" r=\"{r}\" />\n")
@@ -262,6 +109,14 @@ fn letterforms<'a>(groups: &'a [LetterformGroup]) -> impl Iterator<Item = &'a Le
     groups.iter().flat_map(|g| g.letterforms.values())
 }
 
+fn path_safe_c(c: char) -> String {
+    if path::is_separator(c) {
+        format!("0x{:04x}x", c as u32)
+    } else {
+        format!("{c}")
+    }
+}
+
 fn dump_glyphs(working_dir: &Path, all_letterforms: &HashMap<char, Vec<LetterformGroup>>) {
     for (c, group) in all_letterforms.iter() {
         let viewbox = letterforms(group)
@@ -291,17 +146,82 @@ fn dump_glyphs(working_dir: &Path, all_letterforms: &HashMap<char, Vec<Letterfor
 
         svg.push_str("</svg>\n");
         let suffix = if group.len() > 1 { "-inconsistent" } else { "" };
-        fs::write(working_dir.join(format!("{c}{suffix}.svg")), svg).unwrap();
+        let c = path_safe_c(*c);
+        let dest = working_dir.join(format!("glyph_{c}{suffix}.svg"));
+        fs::write(&dest, svg).unwrap_or_else(|e| panic!("Unable to write {dest:?}: {e}"));
     }
 }
 
-fn main() {
-    let args = Args::parse();
-    init_logging();
+fn dump_groups(working_dir: &Path, all_letterforms: &HashMap<char, Vec<LetterformGroup>>) {
+    for (c, groups) in all_letterforms.iter() {
+        for (i, group) in groups.iter().enumerate() {
+            let mut paths = group
+                .letterforms
+                .keys()
+                .map(|p| p.to_str().unwrap())
+                .collect::<Vec<_>>();
+            paths.sort();
+            let mut content = format!("{} files with matching {c}\n", paths.len());
+            for path in paths {
+                content.push_str(path);
+                content.push('\n');
+            }
+            let c = path_safe_c(*c);
+            let dest = working_dir.join(format!("group_{c}.{i}.txt"));
+            fs::write(&dest, content).unwrap_or_else(|e| panic!("Unable to write {dest:?}: {e}"));
+        }
+    }
+}
 
-    let raw_fonts = load_fonts(args.files.iter().map(Path::new))
-        .unwrap_or_else(|e| panic!("Unable to load fonts {e}"));
+fn log_groups(test_chars: &[char], letterforms: &HashMap<char, Vec<LetterformGroup>>) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    for c in test_chars.iter() {
+        let groups = letterforms
+            .get(c)
+            .expect("All test chars should be defined");
+        log::debug!("{} groups for '{c}'", groups.len());
+        for (i, group) in groups.iter().enumerate() {
+            log::debug!(
+                "  {i}: {:?}",
+                group
+                    .letterforms
+                    .keys()
+                    .map(|p| p.to_string_lossy())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
 
+fn dump_stuff(args: &Args, letterforms: &HashMap<char, Vec<LetterformGroup>>) {
+    let working_dir = Path::new(&args.working_dir);
+    if working_dir.is_dir() {
+        for del_pat in ["*.svg", "*.txt"] {
+            for file in
+                glob::glob(working_dir.join(del_pat).to_str().expect("Oh no")).expect("To glob")
+            {
+                let file = file.expect("Access to working dir");
+                fs::remove_file(file).expect("To be able to delete working dir files");
+            }
+        }
+    } else {
+        fs::create_dir(working_dir).unwrap();
+    }
+    if args.dump_glyphs {
+        dump_glyphs(working_dir, letterforms);
+    }
+    if args.dump_groups {
+        dump_groups(working_dir, letterforms);
+    }
+}
+
+fn create_grouped_letterforms<'a>(
+    rules: RulesOfSimilarity,
+    test_chars: &[char],
+    raw_fonts: &'a HashMap<PathBuf, Vec<u8>>,
+) -> Result<HashMap<char, Vec<LetterformGroup<'a>>>, ()> {
     let fonts: HashMap<_, _> = raw_fonts
         .iter()
         .map(|(path, bytes)| {
@@ -314,7 +234,7 @@ fn main() {
 
     if fonts.is_empty() {
         log::error!("Not much to do with no fonts specified");
-        return;
+        return Err(());
     }
 
     // we will scale to the largest upem
@@ -323,19 +243,11 @@ fn main() {
         .map(|f| f.head().unwrap().units_per_em())
         .max()
         .unwrap();
-    let mut test_chars = args
-        .test_string
-        .chars()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    test_chars.sort();
-    let test_chars = test_chars;
-    let mut glyphs: HashMap<char, Vec<BezPath>> = Default::default();
 
     // budget is based on 1000 upem; scale if necessary
-    let rules = args.rules().for_upem(max_upem);
+    let rules = rules.for_upem(max_upem);
     log::info!("The rules are {rules:?}");
+    let mut glyphs: HashMap<char, Vec<BezPath>> = Default::default();
 
     // Really we should shape the test string but we don't have a safe shaper.
     // This should suffice for copied Latin which is our primarily use case.
@@ -367,38 +279,21 @@ fn main() {
             }
         }
     }
+    Ok(letterforms)
+}
 
-    if args.dump_glyphs {
-        let working_dir = Path::new(&args.working_dir);
-        if !working_dir.is_dir() {
-            fs::create_dir(working_dir).unwrap();
-        }
-        println!("Dumping glyphs to {working_dir:?}");
-        for svg_file in
-            glob::glob(working_dir.join("*.svg").to_str().expect("Oh no")).expect("To glob")
-        {
-            let svg_file = svg_file.expect("Access to working dir");
-            fs::remove_file(svg_file).expect("To be able to delete working dir files");
-        }
-        dump_glyphs(working_dir, &letterforms);
-    }
+fn main() {
+    let args = Args::parse();
+    init_logging();
 
-    for c in test_chars.iter() {
-        let groups = letterforms
-            .get(c)
-            .expect("All test chars should be defined");
-        log::debug!("{} groups for '{c}'", groups.len());
-        for (i, group) in groups.iter().enumerate() {
-            log::debug!(
-                "  {i}: {:?}",
-                group
-                    .letterforms
-                    .keys()
-                    .map(|p| p.to_string_lossy())
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
+    let test_chars = args.test_chars();
+    let raw_fonts = load_fonts(args.files.iter().map(Path::new))
+        .unwrap_or_else(|e| panic!("Unable to load fonts {e}"));
+
+    let letterforms = create_grouped_letterforms(args.rules(), &test_chars, &raw_fonts).unwrap();
+
+    log_groups(&test_chars, &letterforms);
+    dump_stuff(&args, &letterforms);
 
     // Did we find sets of fonts that share glyphs?
     let mut share_counts: HashMap<BTreeSet<&Path>, usize> = Default::default();

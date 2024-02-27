@@ -84,3 +84,5 @@ sys	0m5.124s
 ```
 
 That was appallingly slow ... probably a release build and a small amount of time with flamegraph would dramatically improve matters!
+
+BUG: a few static families were omitted due to not having a -Regular. Now fixed.

@@ -164,7 +164,8 @@ impl Args {
                     let exemplar = font_files.pop().unwrap();
                     log::debug!("Picked {:?} as exemplar", exemplar);
                     files.insert(exemplar);
-                } else if let Some(exemplar) = font_files.into_iter().find(|f| {
+                } else if let Some(exemplar) = font_files.iter().find(|f| {
+                    // Many static families follow this pattern
                     f.file_name()
                         .unwrap()
                         .to_str()
@@ -172,7 +173,14 @@ impl Args {
                         .contains("-Regular")
                 }) {
                     log::debug!("Picked {:?} as exemplar", exemplar);
-                    files.insert(exemplar);
+                    files.insert(exemplar.clone());
+                } else if let Some(exemplar) = font_files.iter().find(|f| {
+                    // Some old static families just have FamilyName.ttf not FamilyName-Regular.ttf
+                    // For example, Thabit.ttf, Thabit-Bold.ttf, etc
+                    !f.file_name().unwrap().to_str().unwrap().contains("-")
+                }) {
+                    log::debug!("Picked {:?} as exemplar", exemplar);
+                    files.insert(exemplar.clone());
                 } else {
                     log::warn!("Unable to identify an exemplar from {font_pattern}");
                 }

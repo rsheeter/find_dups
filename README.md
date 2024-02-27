@@ -81,8 +81,12 @@ real	57m23.476s
 user	57m30.812s
 sys	0m5.124s
 
+# If I had remembered to build --release then run:
+real	13m44.851s
+user	13m43.066s
+sys	0m1.734s
 ```
 
-That was appallingly slow ... probably a release build and a small amount of time with flamegraph would dramatically improve matters!
+That was appallingly slow.
 
 BUG: a few static families were omitted due to not having a -Regular. Now fixed.

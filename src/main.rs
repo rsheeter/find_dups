@@ -10,7 +10,7 @@ use skrifa::{instance::Size, raw::TableProvider, FontRef, MetadataProvider};
 use write_fonts::pens::BezPathPen;
 
 use find_dups::{
-    about_the_same::{AboutTheSame, ApproximatelyEqualError, RulesOfSimilarity},
+    about_the_same::{AboutTheSame, ApproximatelyEqualError, GlyphPath, RulesOfSimilarity},
     args::Args,
 };
 
@@ -70,7 +70,7 @@ impl<'a> LetterformGroup<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct Letterform(BezPath);
+struct Letterform(GlyphPath);
 
 impl AboutTheSame for Letterform {
     fn approximately_equal(
@@ -103,7 +103,7 @@ impl Letterform {
                 path.apply_affine(Affine::translate((-minx, -miny)));
             }
         }
-        Self(path)
+        Self(GlyphPath::new(path))
     }
 }
 
@@ -122,7 +122,7 @@ fn path_safe_c(c: char) -> String {
 fn dump_glyphs(working_dir: &Path, all_letterforms: &HashMap<char, Vec<LetterformGroup>>) {
     for (c, group) in all_letterforms.iter() {
         let viewbox = letterforms(group)
-            .map(|l| l.0.bounding_box())
+            .map(|l| l.0.path.bounding_box())
             .reduce(|acc, e| acc.union(e))
             .unwrap_or_default();
         let marker_radius = viewbox.width() * 0.02;
@@ -137,11 +137,13 @@ fn dump_glyphs(working_dir: &Path, all_letterforms: &HashMap<char, Vec<Letterfor
         );
         for path in letterforms(group).map(|l| &l.0) {
             // actual path
-            svg.push_str(format!("<path opacity=\"0.25\" d=\"{}\" />\n", path.to_svg()).as_str());
+            svg.push_str(
+                format!("<path opacity=\"0.25\" d=\"{}\" />\n", path.path.to_svg()).as_str(),
+            );
         }
         for path in letterforms(group).map(|l| &l.0) {
             // start marker
-            if let Some(PathEl::MoveTo(p)) = path.elements().first() {
+            if let Some(PathEl::MoveTo(p)) = path.path.elements().first() {
                 svg.push_str(svg_circle(p.x, p.y, marker_radius).as_str());
             }
         }
@@ -249,7 +251,7 @@ fn create_grouped_letterforms<'a>(
     // budget is based on 1000 upem; scale if necessary
     let rules = rules.for_upem(max_upem);
     log::info!("The rules are {rules:?}");
-    let mut glyphs: HashMap<char, Vec<BezPath>> = Default::default();
+    let mut glyphs: HashMap<char, Vec<GlyphPath>> = Default::default();
 
     // Really we should shape the test string but we don't have a safe shaper.
     // This should suffice for copied Latin which is our primarily use case.
@@ -326,4 +328,9 @@ fn main() {
             println!("{paths:?}, {score}/{}", test_chars.len());
         }
     }
+
+    println!(
+        "{} nearest's",
+        find_dups::about_the_same::NUM_NEAREST.load(std::sync::atomic::Ordering::Acquire)
+    );
 }
